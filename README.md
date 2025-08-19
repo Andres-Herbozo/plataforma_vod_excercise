@@ -1,4 +1,4 @@
-# Arquitectura Cloud para Plataforma VOD - Módulo 6 DevOps
+# Arquitectura Cloud para Plataforma VOD - (Ejercicio de Módulo 6 BootCamp DevOps)
 
 ## Descripción del Proyecto
 Diseño de infraestructura cloud escalable y segura para una plataforma de Video On Demand (VOD) similar a Netflix, capaz de soportar miles de usuarios simultáneos con disponibilidad global.
