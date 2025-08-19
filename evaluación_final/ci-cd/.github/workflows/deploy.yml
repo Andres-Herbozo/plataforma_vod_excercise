@@ -1,0 +1,415 @@
+# =============================================================================
+# WORKFLOW DE CI/CD PARA PLATAFORMA VOD
+# GitHub Actions - Despliegue Automatizado a AWS
+# =============================================================================
+
+name: 🚀 CI/CD Pipeline - VOD Platform
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'diagrams/**'
+      - 'infrastructure/**'
+  
+  pull_request:
+    branches: [ main, develop ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'diagrams/**'
+      - 'infrastructure/**'
+  
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Ambiente de despliegue'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+      force_deploy:
+        description: 'Forzar despliegue'
+        required: false
+        default: false
+        type: boolean
+
+# Variables de entorno globales
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: vod-service
+  ECS_CLUSTER: prod-vod-cluster
+  ECS_SERVICE: vod-service
+  ECS_TASK_DEFINITION: prod-vod-service
+
+# Jobs del workflow
+jobs:
+  # =============================================================================
+  # VALIDACIÓN Y ANÁLISIS DE CÓDIGO
+  # =============================================================================
+  code-quality:
+    name: 🔍 Análisis de Calidad de Código
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 📥 Checkout del código
+        uses: actions/checkout@v4
+        
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: 📦 Instalar dependencias de desarrollo
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 black isort mypy bandit safety
+          
+      - name: 🧹 Linting con Flake8
+        run: |
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+          
+      - name: 🎨 Formateo con Black
+        run: |
+          black --check --diff .
+          
+      - name: 📋 Ordenamiento de imports con isort
+        run: |
+          isort --check-only --diff .
+          
+      - name: 🔍 Type checking con MyPy
+        run: |
+          mypy --ignore-missing-imports .
+          
+      - name: 🛡️ Análisis de seguridad con Bandit
+        run: |
+          bandit -r . -f json -o bandit-report.json || true
+          
+      - name: 🔒 Verificación de dependencias con Safety
+        run: |
+          safety check --json --output safety-report.json || true
+
+  # =============================================================================
+  # TESTING AUTOMATIZADO
+  # =============================================================================
+  testing:
+    name: 🧪 Testing Automatizado
+    runs-on: ubuntu-latest
+    needs: code-quality
+    
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.10', '3.11']
+        
+    steps:
+      - name: 📥 Checkout del código
+        uses: actions/checkout@v4
+        
+      - name: 🐍 Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+          
+      - name: 📦 Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+          
+      - name: 🧪 Ejecutar tests unitarios
+        run: |
+          python -m pytest tests/unit/ -v --cov=src --cov-report=xml --cov-report=html
+          
+      - name: 🔄 Ejecutar tests de integración
+        run: |
+          python -m pytest tests/integration/ -v
+          
+      - name: 📊 Ejecutar tests de rendimiento
+        run: |
+          python -m pytest tests/performance/ -v
+          
+      - name: 📈 Generar reporte de cobertura
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+
+  # =============================================================================
+  # BUILD Y SECURITY SCANNING
+  # =============================================================================
+  build-and-scan:
+    name: 🔨 Build y Análisis de Seguridad
+    runs-on: ubuntu-latest
+    needs: testing
+    
+    steps:
+      - name: 📥 Checkout del código
+        uses: actions/checkout@v4
+        
+      - name: 🔐 Configurar credenciales de AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: 🔑 Login a Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        
+      - name: 🐳 Build de imagen Docker
+        run: |
+          docker build \
+            --build-arg BUILDKIT_INLINE_CACHE=1 \
+            --cache-from ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest \
+            -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }} \
+            -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest \
+            .
+            
+      - name: 🛡️ Escaneo de seguridad de la imagen
+        run: |
+          # Instalar Trivy
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.45.0
+          
+          # Escanear vulnerabilidades
+          trivy image --severity HIGH,CRITICAL \
+            --format json \
+            --output trivy-report.json \
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            
+      - name: 🔍 Análisis estático de la imagen
+        run: |
+          # Instalar Dive para análisis de capas
+          curl -sL https://github.com/wagoodman/dive/releases/download/v0.9.2/dive_0.9.2_linux_amd64.tar.gz | tar -xz
+          chmod +x dive
+          
+          # Analizar eficiencia de la imagen
+          ./dive --json ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }} > dive-report.json
+          
+      - name: 📤 Push de imagen a ECR
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+        run: |
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+
+  # =============================================================================
+  # DESPLIEGUE A STAGING
+  # =============================================================================
+  deploy-staging:
+    name: 🚀 Despliegue a Staging
+    runs-on: ubuntu-latest
+    needs: build-and-scan
+    if: github.ref == 'refs/heads/develop' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging')
+    environment: staging
+    
+    steps:
+      - name: 📥 Checkout del código
+        uses: actions/checkout@v4
+        
+      - name: 🔐 Configurar credenciales de AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: 🔑 Login a Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        
+      - name: 📋 Actualizar definición de tarea ECS
+        run: |
+          aws ecs register-task-definition \
+            --cli-input-json file://infrastructure/ecs-task-definition-staging.json \
+            --region ${{ env.AWS_REGION }}
+            
+      - name: 🚀 Desplegar a ECS Staging
+        run: |
+          aws ecs update-service \
+            --cluster staging-vod-cluster \
+            --service vod-service-staging \
+            --task-definition vod-service-staging \
+            --region ${{ env.AWS_REGION }}
+            
+      - name: ⏳ Esperar estabilización del servicio
+        run: |
+          aws ecs wait services-stable \
+            --cluster staging-vod-cluster \
+            --services vod-service-staging \
+            --region ${{ env.AWS_REGION }}
+            
+      - name: 🧪 Tests de smoke en staging
+        run: |
+          # Esperar a que el servicio esté disponible
+          sleep 60
+          
+          # Ejecutar tests básicos de funcionalidad
+          python -m pytest tests/smoke/ -v --base-url https://staging.vodplatform.com
+
+  # =============================================================================
+  # DESPLIEGUE A PRODUCCIÓN
+  # =============================================================================
+  deploy-production:
+    name: 🚀 Despliegue a Producción
+    runs-on: ubuntu-latest
+    needs: [build-and-scan, deploy-staging]
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production')
+    environment: production
+    
+    steps:
+      - name: 📥 Checkout del código
+        uses: actions/checkout@v4
+        
+      - name: 🔐 Configurar credenciales de AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: 🔑 Login a Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        
+      - name: 📋 Actualizar definición de tarea ECS
+        run: |
+          aws ecs register-task-definition \
+            --cli-input-json file://infrastructure/ecs-task-definition-production.json \
+            --region ${{ env.AWS_REGION }}
+            
+      - name: 🚀 Desplegar a ECS Producción
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --task-definition ${{ env.ECS_TASK_DEFINITION }} \
+            --region ${{ env.AWS_REGION }}
+            
+      - name: ⏳ Esperar estabilización del servicio
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --region ${{ env.AWS_REGION }}
+            
+      - name: 🧪 Tests de smoke en producción
+        run: |
+          # Esperar a que el servicio esté disponible
+          sleep 60
+          
+          # Ejecutar tests básicos de funcionalidad
+          python -m pytest tests/smoke/ -v --base-url https://vodplatform.com
+          
+      - name: 📊 Notificación de despliegue exitoso
+        if: success()
+        run: |
+          echo "🚀 Despliegue a producción completado exitosamente!"
+          echo "📅 Fecha: $(date)"
+          echo "🔗 Commit: ${{ github.sha }}"
+          echo "👤 Usuario: ${{ github.actor }}"
+
+  # =============================================================================
+  # MONITOREO POST-DESPLIEGUE
+  # =============================================================================
+  post-deployment-monitoring:
+    name: 📊 Monitoreo Post-Despliegue
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-production]
+    if: always()
+    
+    steps:
+      - name: 📥 Checkout del código
+        uses: actions/checkout@v4
+        
+      - name: 🔐 Configurar credenciales de AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: 📈 Verificar métricas de CloudWatch
+        run: |
+          # Verificar métricas de ECS
+          aws cloudwatch get-metric-statistics \
+            --namespace AWS/ECS \
+            --metric-name CPUUtilization \
+            --dimensions Name=ClusterName,Value=${{ env.ECS_CLUSTER }} \
+            --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S) \
+            --end-time $(date -u +%Y-%m-%dT%H:%M:%S) \
+            --period 300 \
+            --statistics Average \
+            --region ${{ env.AWS_REGION }}
+            
+      - name: 🔍 Verificar logs de ECS
+        run: |
+          # Verificar logs recientes
+          aws logs describe-log-streams \
+            --log-group-name /ecs/${{ env.ECS_TASK_DEFINITION }} \
+            --order-by LastEventTime \
+            --descending \
+            --max-items 5 \
+            --region ${{ env.AWS_REGION }}
+            
+      - name: 🚨 Verificar alarmas activas
+        run: |
+          # Listar alarmas en estado ALARM
+          aws cloudwatch describe-alarms \
+            --state-value ALARM \
+            --region ${{ env.AWS_REGION }} \
+            --query 'MetricAlarms[?contains(AlarmName, `vod`)]'
+
+  # =============================================================================
+  # ROLLBACK AUTOMÁTICO (SI ES NECESARIO)
+  # =============================================================================
+  rollback:
+    name: 🔄 Rollback Automático
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-production]
+    if: failure()
+    
+    steps:
+      - name: 📥 Checkout del código
+        uses: actions/checkout@v4
+        
+      - name: 🔐 Configurar credenciales de AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: 🔍 Identificar versión anterior estable
+        id: previous-version
+        run: |
+          # Obtener la versión anterior de la definición de tarea
+          PREVIOUS_TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition ${{ env.ECS_TASK_DEFINITION }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          
+          echo "previous-task-def=$PREVIOUS_TASK_DEF" >> $GITHUB_OUTPUT
+          
+      - name: 🔄 Ejecutar rollback
+        run: |
+          # Revertir a la versión anterior
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --task-definition ${{ steps.previous-version.outputs.previous-task-def }} \
+            --region ${{ env.AWS_REGION }}
+            
+      - name: 📢 Notificar rollback
+        run: |
+          echo "🚨 ROLLBACK EJECUTADO!"
+          echo "📅 Fecha: $(date)"
+          echo "🔗 Commit fallido: ${{ github.sha }}"
+          echo "👤 Usuario: ${{ github.actor }}"
+          echo "⚠️ Se ha revertido a la versión anterior estable"
